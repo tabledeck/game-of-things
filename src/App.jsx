@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Trash2 } from "lucide-react";
+import {useEffect, useState} from "react";
+import {Trash2} from "lucide-react";
 
 const defaultNames = [
   "Zach",
@@ -15,28 +15,45 @@ const defaultNames = [
 ];
 
 export default function App() {
-  const [people, setPeople] = useState([]);
+  const [people, setPeople] = useState(undefined);
   const [newName, setNewName] = useState("");
   const [clicked, setClicked] = useState({});
   const [notes, setNotes] = useState({});
+  const [networkUrl, setNetworkUrl] = useState("");
 
-  // Load people from localStorage or default list
+  // Get actual network IP
   useEffect(() => {
-    const stored = localStorage.getItem("people-list");
-    if (stored) {
-      setPeople(JSON.parse(stored));
-    } else {
-      setPeople(defaultNames);
+    fetch("/api/network-info")
+      .then((res) => res.json())
+      .then((data) => {
+        const url = `http://${data.ip}:${data.port}`;
+        setNetworkUrl(url);
+      })
+      .catch(() => {
+        // Fallback to current URL if API fails
+        setNetworkUrl(window.location.origin);
+      });
+  }, []);
+
+  // Initialize from localStorage or defaults
+  useEffect(() => {
+    if (people === undefined) {
+      const stored = localStorage.getItem("people-list");
+      if (stored !== null && stored?.length > 2) {
+        setPeople(JSON.parse(stored));
+      } else {
+        setPeople(defaultNames);
+        localStorage.setItem("people-list", JSON.stringify(defaultNames));
+      }
     }
   }, []);
 
-  // Save people list to localStorage
+  // Save changes to localStorage
   useEffect(() => {
-    if (people.length > 0) {
+    // Skip the initial render to avoid race condition
+    const stored = localStorage.getItem("people-list");
+    if (stored !== null && people !== undefined) {
       localStorage.setItem("people-list", JSON.stringify(people));
-    } else {
-      // Clear localStorage if no people left
-      localStorage.removeItem("people-list");
     }
   }, [people]);
 
@@ -68,7 +85,11 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col items-center p-6">
-      <h1 className="text-3xl font-bold mb-4">People Cards</h1>
+      {/* Network URL in top right */}
+      <div className="absolute top-4 right-4 bg-white px-3 py-2 rounded-md shadow-md hidden sm:block">
+        <span className="text-xs text-gray-500">Network URL: </span>
+        <span className="text-xs font-mono text-blue-600">{networkUrl}</span>
+      </div>
 
       <div className="flex space-x-2 mb-8">
         <input
@@ -87,8 +108,8 @@ export default function App() {
         </button>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-6">
-        {people.map((name) => (
+      <div className="grid grid-cols-3 md:grid-cols-5 gap-6">
+        {people?.map((name) => (
           <div key={name} className="flex flex-col items-center space-y-2">
             <button
               onClick={() =>
@@ -130,7 +151,7 @@ export default function App() {
           e.target.style.height = "auto";
           e.target.style.height = e.target.scrollHeight + "px";
         }}
-        className="border rounded-md p-2 w-[456px] text-sm resize-none overflow-hidden min-h-[32px]"
+        className="border rounded-md p-2 max-w-[456px] w-[90%] text-sm resize-none overflow-hidden min-h-[32px]"
         rows="1"
       />
     </div>

@@ -1,32 +1,26 @@
-import React, { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, type CSSProperties, type ChangeEvent } from "react";
 import { data } from "react-router";
 import type { Route } from "./+types/game.$gameId";
 import { getPrisma } from "~/db.server";
 import { useGameWebSocket } from "@tabledeck/game-room/client";
 import { readGuestCookie } from "@tabledeck/game-room/server";
 import type { GotState } from "~/domain/types";
-import type { ServerMessage } from "~/domain/messages";
 
 import BtnPrimary from "~/components/tabledeck/BtnPrimary";
 import BtnSecondary from "~/components/tabledeck/BtnSecondary";
 import Plaque from "~/components/tabledeck/Plaque";
 import Pin from "~/components/icons/Pin";
-import Strike from "~/components/icons/Strike";
 import TrashIcon from "~/components/icons/TrashIcon";
 import LinkIcon from "~/components/icons/LinkIcon";
-import PencilIcon from "~/components/icons/PencilIcon";
 import PlusIcon from "~/components/icons/PlusIcon";
 import CloseIcon from "~/components/icons/CloseIcon";
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
-  const hostName = (loaderData as any)?.hostName || "Host";
+  const hostName = (loaderData as { hostName?: string } | undefined)?.hostName || "Host";
   return [{ title: `The Game of Things — ${hostName}'s table` }];
 }
 
-// ── Rotation seeds so each player note gets a consistent tilt ─────────────────
-const PIN_ROTATIONS = [-2.5, 1.8, -1.2, 2.8, -1.8, 1.2, -2.2, 2.0, -0.8, 1.5];
-
-// ── Loader ────────────────────────────────────────────────────────────────────
+const PIN_ROTATIONS = [-2.2, 1.6, -1.1, 2.1, -1.6, 1.1, -2.0, 1.8, -0.7, 1.4];
 
 export async function loader({ params, request, context }: Route.LoaderArgs) {
   const { gameId } = params;
@@ -35,13 +29,11 @@ export async function loader({ params, request, context }: Route.LoaderArgs) {
   const game = await db.game.findUnique({ where: { id: gameId } });
   if (!game) throw data({ error: "Game not found" }, { status: 404 });
 
-  // Determine host identity from cookie
   const identity = readGuestCookie(request, `got_${gameId}`);
   const isHost = identity?.seat === 0;
   const myName = identity?.name ?? "Spectator";
 
-  // Fetch initial state from Durable Object
-  const env = (context as any).cloudflare?.env as Env | undefined;
+  const env = (context as { cloudflare?: { env?: Env } }).cloudflare?.env;
   let initialState: GotState | null = null;
   if (env) {
     try {
@@ -53,7 +45,7 @@ export async function loader({ params, request, context }: Route.LoaderArgs) {
         initialState = body.state;
       }
     } catch {
-      // Non-fatal — WS connect will hydrate state
+      // WS connect will hydrate state
     }
   }
 
@@ -71,216 +63,352 @@ export async function loader({ params, request, context }: Route.LoaderArgs) {
   };
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+type ModalState =
+  | null
+  | { type: "reset-round" }
+  | { type: "reset-scores" }
+  | { type: "remove"; name: string };
+
+type Conn = "connecting" | "live" | "reconnecting";
 
 export default function GameRoom({ loaderData }: Route.ComponentProps) {
-  const { gameId, hostName, isHost, myName, mySeat, initialState, shareUrl } =
-    loaderData;
+  const { gameId, hostName, isHost, myName, mySeat, initialState, shareUrl } = loaderData;
 
-  // ── State ──────────────────────────────────────────────────────────────────
   const [gotState, setGotState] = useState<GotState | null>(initialState);
-  const [copied, setCopied] = useState(false);
-  const [resetModalOpen, setResetModalOpen] = useState(false);
+  const [liveShareUrl, setLiveShareUrl] = useState(shareUrl);
+  const [toast, setToast] = useState<string | null>(null);
+  const [modal, setModal] = useState<ModalState>(null);
+  const [conn, setConn] = useState<Conn>(initialState ? "live" : "connecting");
+  const [hostOnline, setHostOnline] = useState(true);
+  const toastTimer = useRef<number | null>(null);
+  const lastHeard = useRef(initialState ? Date.now() : 0);
+  const socketReady = useRef(false);
+  const connRef = useRef<Conn>(initialState ? "live" : "connecting");
+  const mountedAt = useRef(Date.now());
 
-  // ── WebSocket ──────────────────────────────────────────────────────────────
+  const flash = useCallback((text: string) => {
+    setToast(text);
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 2400);
+  }, []);
+
+  const markHeard = useCallback(() => {
+    lastHeard.current = Date.now();
+    socketReady.current = true;
+    if (connRef.current !== "live") {
+      connRef.current = "live";
+      setConn("live");
+    }
+  }, []);
+
   const { send } = useGameWebSocket({
     gameId,
     seat: mySeat,
     name: myName,
-    onMessage: useCallback((rawMsg: unknown) => {
-      const msg = rawMsg as { type: string } & ServerMessage;
-      if (msg.type === "state_updated") {
-        setGotState(msg.state);
-      } else if (msg.type === "game_state") {
-        // Initial state push from the DO on connection
-        const s = (msg as any).state as GotState;
-        if (s) setGotState(s);
-      }
-    }, []),
+    onMessage: useCallback(
+      (rawMsg: unknown) => {
+        const msg = rawMsg as {
+          type?: string;
+          message?: string;
+          seat?: number;
+          state?: GotState;
+        };
+        if (msg.type === "pong" || msg.type === "state_updated" || msg.type === "game_state") {
+          markHeard();
+        }
+        if (msg.type === "state_updated" || msg.type === "game_state") {
+          if (msg.state) setGotState(msg.state);
+        } else if (msg.type === "error" && msg.message) {
+          flash(msg.message);
+        } else if (msg.type === "player_disconnected" && msg.seat === 0) {
+          setHostOnline(false);
+        } else if (msg.type === "player_joined" && msg.seat === 0) {
+          setHostOnline(true);
+          markHeard();
+        }
+      },
+      [flash, markHeard],
+    ),
   });
 
-  // ── Copy share link ────────────────────────────────────────────────────────
+  useEffect(() => {
+    setLiveShareUrl(`${window.location.origin}/game/${gameId}`);
+  }, [gameId]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      send({ type: "ping" });
+      const heard = lastHeard.current;
+      const quiet = heard ? Date.now() - heard > 12000 : Date.now() - mountedAt.current > 8000;
+      if (quiet && connRef.current !== "reconnecting") {
+        connRef.current = "reconnecting";
+        setConn("reconnecting");
+      }
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [send]);
+
   const copyLink = async () => {
     try {
-      await navigator.clipboard.writeText(shareUrl);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2200);
+      await navigator.clipboard.writeText(liveShareUrl);
+      flash("Link copied");
     } catch {
-      // Fallback: silent fail
+      flash("Select the link and copy it");
+      document.getElementById("share-link")?.focus();
     }
   };
 
-  // ── Derived state ──────────────────────────────────────────────────────────
+  const shareLink = async () => {
+    const payload = {
+      title: "The Game of Things",
+      text: `Follow ${hostName}'s table`,
+      url: liveShareUrl,
+    };
+    if (typeof navigator.share === "function") {
+      try {
+        await navigator.share(payload);
+        return;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+      }
+    }
+    await copyLink();
+  };
+
   const topic = gotState?.topic ?? "";
   const players = gotState?.players ?? [];
   const notes = gotState?.notes ?? "";
+  const ready = gotState !== null;
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  const guarded = (fn: () => void) => {
+    if (!socketReady.current || connRef.current === "reconnecting") {
+      flash("Still connecting — try again in a moment");
+      return;
+    }
+    fn();
+  };
+
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        padding: "clamp(16px, 4vw, 40px) clamp(16px, 5vw, 48px)",
-      }}
-    >
-      {/* ── Masthead ─────────────────────────────────────────────────────── */}
-      <header
-        className="w-full"
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 32,
-          paddingLeft: 2,
-          paddingRight: 2,
-        }}
-      >
-        {/* Title plaque */}
-        <Plaque style={{ padding: "16px 28px" }}>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-            <span
-              style={{
-                display: "block",
-                fontFamily: "var(--serif)",
-                fontStyle: "italic",
-                fontWeight: 600,
-                color: "var(--ink)",
-                fontSize: "clamp(20px, 3.5vw, 34px)",
-                lineHeight: 1,
-                letterSpacing: "0.02em",
-              }}
-            >
-              The Game of Things
-            </span>
-            <span
-              style={{
-                display: "block",
-                fontFamily: "var(--serif)",
-                fontVariant: "small-caps",
-                fontSize: "10.5px",
-                letterSpacing: "0.32em",
-                color: "rgba(42,31,22,0.5)",
-                marginTop: 4,
-              }}
-            >
-              Hosted by {hostName}
-            </span>
-          </div>
-        </Plaque>
-
-        {/* Action chips */}
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-          {isHost ? (
-            <>
-              {/* SHARE LINK */}
-              <button
-                onClick={copyLink}
-                className="td-ticket-bone"
-                type="button"
-                aria-label="Copy share link"
-              >
-                <LinkIcon size={13} />
-                <span style={{ fontFamily: "var(--serif)", fontVariant: "small-caps", letterSpacing: "0.18em", fontSize: 12 }}>Share Link</span>
-              </button>
-              {/* RESET ROUND */}
-              <button
-                onClick={() => setResetModalOpen(true)}
-                className="td-ticket-bone"
-                type="button"
-                aria-label="Reset round"
-              >
-                <span style={{ fontFamily: "var(--serif)", fontVariant: "small-caps", letterSpacing: "0.18em", fontSize: 12 }}>Reset Round</span>
-              </button>
-            </>
-          ) : (
-            /* VIEWING chip — non-interactive */
-            <div className="td-ticket" style={{ cursor: "default" }}>
-              <span
-                style={{
-                  fontFamily: "var(--serif)",
-                  fontVariant: "small-caps",
-                  letterSpacing: "0.2em",
-                  fontSize: 11,
-                  color: "rgba(42,31,22,0.6)",
-                }}
-              >
-                Viewing
-              </span>
+    <>
+      <div id="table-root" className="table-page" inert={modal ? true : undefined}>
+        <header className="masthead">
+          <Plaque style={{ padding: "12px 18px" }}>
+            <div className="mast-title">
+              <a className="mast-home" href="https://tabledeck.us">
+                Tabledeck
+              </a>
+              <h1>The Game of Things</h1>
+              <span className="mast-host">Hosted by {hostName}</span>
             </div>
-          )}
-        </div>
-      </header>
+          </Plaque>
 
-      {/* ── Prompt Card ──────────────────────────────────────────────────── */}
-      <PromptCard topic={topic} isHost={isHost} onSetTopic={(t) => send({ type: "set_topic", topic: t })} />
+          <div className="mast-actions">
+            <span className="live-pill" data-state={conn}>
+              <span className="live-dot" aria-hidden="true" />
+              {conn === "live" ? "Live" : conn === "connecting" ? "Connecting" : "Reconnecting"}
+            </span>
+            {isHost ? (
+              <BtnSecondary type="button" onClick={() => setModal({ type: "reset-round" })} disabled={!ready}>
+                Next round
+              </BtnSecondary>
+            ) : (
+              <div className="td-ticket follow-chip" style={{ cursor: "default" }}>
+                <span style={{ fontFamily: "var(--serif)", fontVariant: "small-caps", letterSpacing: "0.14em", fontSize: 13 }}>
+                  Following
+                </span>
+              </div>
+            )}
+          </div>
+        </header>
 
-      {/* ── Add Player Form (host only) ───────────────────────────────────── */}
-      {isHost && (
-        <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}>
-          <AddPlayerForm onAdd={(name) => send({ type: "add_player", name })} />
+        <RoundStatus
+          isHost={isHost}
+          hostName={hostName}
+          hostOnline={hostOnline || isHost}
+          ready={ready}
+          topic={topic}
+          players={players}
+        />
+
+        <PromptCard
+          topic={topic}
+          isHost={isHost && ready}
+          onSetTopic={(t) => guarded(() => send({ type: "set_topic", topic: t }))}
+        />
+
+        <section className="share-bar" aria-label="Share this table">
+          <div>
+            <p className="share-label">Pass this link around</p>
+            <input
+              id="share-link"
+              className="share-link"
+              readOnly
+              value={liveShareUrl}
+              aria-label="Link to this table"
+              onFocus={(e) => e.currentTarget.select()}
+            />
+          </div>
+          <div className="share-actions">
+            <BtnSecondary type="button" onClick={() => void copyLink()}>
+              <LinkIcon size={16} />
+              Copy
+            </BtnSecondary>
+            <BtnPrimary type="button" onClick={() => void shareLink()}>
+              Share
+            </BtnPrimary>
+          </div>
+        </section>
+
+        {isHost && ready && (
+          <AddPlayerForm
+            players={players}
+            onAdd={(name) => guarded(() => send({ type: "add_player", name }))}
+          />
+        )}
+
+        <PlayerBoard
+          players={players}
+          isHost={isHost && ready}
+          onToggle={(name) => guarded(() => send({ type: "toggle_player", name }))}
+          onRemove={(name) => setModal({ type: "remove", name })}
+          onScore={(name, delta) => guarded(() => send({ type: "increment_score", name, delta }))}
+        />
+
+        <Scoreboard
+          players={players}
+          isHost={isHost && ready}
+          onResetScores={() => setModal({ type: "reset-scores" })}
+        />
+
+        <NotesSection
+          notes={notes}
+          isHost={isHost && ready}
+          onSetNotes={(n) => send({ type: "set_notes", notes: n })}
+        />
+
+        <footer className="table-foot">
+          <a href="https://tabledeck.us">Tabledeck</a>
+          <a href="/">Leave</a>
+          <span>Made for the table</span>
+        </footer>
+      </div>
+
+      <div className="sr-only" role="status" aria-live="polite">
+        {toast ?? ""}
+      </div>
+      {toast && (
+        <div className="td-toast-stamp" aria-hidden="true">
+          {toast}
         </div>
       )}
 
-      {/* ── Player Board ──────────────────────────────────────────────────── */}
-      <PlayerBoard
-        players={players}
-        isHost={isHost}
-        onToggle={(name) => send({ type: "toggle_player", name })}
-        onRemove={(name) => send({ type: "remove_player", name })}
-        onScore={(name, delta) => send({ type: "increment_score", name, delta })}
-      />
-
-      {/* ── Scoreboard (compact, live) ────────────────────────────────────── */}
-      <Scoreboard
-        players={players}
-        isHost={isHost}
-        onResetScores={() => send({ type: "reset_scores" })}
-      />
-
-      {/* ── Notes ─────────────────────────────────────────────────────────── */}
-      <NotesSection
-        notes={notes}
-        isHost={isHost}
-        onSetNotes={(n) => send({ type: "set_notes", notes: n })}
-      />
-
-      {/* ── Footer ────────────────────────────────────────────────────────── */}
-      <footer
-        style={{
-          marginTop: 48,
-          textAlign: "center",
-          fontFamily: "var(--serif)",
-          fontVariant: "small-caps",
-          fontSize: "10.5px",
-          letterSpacing: "0.28em",
-          color: "rgba(42,31,22,0.35)",
-          borderTop: "1px solid rgba(42,31,22,0.12)",
-          paddingTop: 14,
-        }}
-      >
-        Tabledeck · The Game of Things · 2026 · Made for the Table
-      </footer>
-
-      {/* ── COPIED toast ────────────────────────────────────────────────── */}
-      {copied && <div className="td-toast-stamp">Copied</div>}
-
-      {/* ── RESET ROUND modal ────────────────────────────────────────────── */}
-      {resetModalOpen && (
-        <ResetModal
-          onCancel={() => setResetModalOpen(false)}
-          onConfirm={() => {
-            send({ type: "reset_round" });
-            setResetModalOpen(false);
+      {modal?.type === "reset-round" && (
+        <ResetRoundModal
+          onCancel={() => setModal(null)}
+          onConfirm={(clearNotes) => {
+            guarded(() => {
+              send({ type: "reset_round" });
+              if (clearNotes) send({ type: "set_notes", notes: "" });
+            });
+            setModal(null);
           }}
         />
       )}
-    </div>
+      {modal?.type === "reset-scores" && (
+        <ConfirmModal
+          title="Reset every score?"
+          body="Points go back to zero. Names, the prompt, and who's in or out stay as they are."
+          confirmLabel="Reset scores"
+          onCancel={() => setModal(null)}
+          onConfirm={() => {
+            guarded(() => send({ type: "reset_scores" }));
+            setModal(null);
+          }}
+        />
+      )}
+      {modal?.type === "remove" && (
+        <ConfirmModal
+          title={`Remove ${modal.name}?`}
+          body="They leave the table and their score goes with them. You can add them again, starting from zero."
+          confirmLabel="Remove"
+          onCancel={() => setModal(null)}
+          onConfirm={() => {
+            guarded(() => send({ type: "remove_player", name: modal.name }));
+            setModal(null);
+          }}
+        />
+      )}
+    </>
   );
 }
 
-// ── PromptCard ────────────────────────────────────────────────────────────────
+function RoundStatus({
+  isHost,
+  hostName,
+  hostOnline,
+  ready,
+  topic,
+  players,
+}: {
+  isHost: boolean;
+  hostName: string;
+  hostOnline: boolean;
+  ready: boolean;
+  topic: string;
+  players: { name: string; isOut: boolean }[];
+}) {
+  const active = players.filter((p) => !p.isOut);
+  const outCount = players.length - active.length;
+
+  let tone: "next" | "wait" | "play" | "last" | "warn" = "next";
+  let title = "Connecting to the table";
+  let body = "Hang on while the board catches up.";
+
+  if (!ready) {
+    tone = "wait";
+  } else if (!isHost && !hostOnline) {
+    tone = "warn";
+    title = "Host stepped away";
+    body = "The board pauses until they open the table again.";
+  } else if (players.length === 0) {
+    tone = isHost ? "next" : "wait";
+    title = isHost ? "Seat the table" : "Waiting for the host";
+    body = isHost
+      ? "Add everyone who's playing, then pass the link. Answers are written on paper."
+      : `${hostName} will add the players. Write on paper when the prompt is read.`;
+  } else if (!topic.trim()) {
+    tone = isHost ? "next" : "wait";
+    title = isHost ? "Set the prompt" : "Waiting for a prompt";
+    body = isHost
+      ? players.length < 3
+        ? "Read it out loud. Three or more players makes the guess better, but you can start with whoever's here."
+        : "Read it out loud. Nobody types an answer here."
+      : "When the host reads the prompt, write your answer on paper.";
+  } else if (active.length === 1 && players.length > 1) {
+    tone = "last";
+    title = `${active[0].name} is the last one in`;
+    body = isHost
+      ? "Give points for the correct guesses, then start the next round."
+      : "One answer still hasn't been matched.";
+  } else if (active.length === 0) {
+    tone = "next";
+    title = "Everyone is out";
+    body = isHost ? "Start the next round when the table is ready." : "Waiting for the next round.";
+  } else {
+    tone = "play";
+    title = isHost ? `${active.length} still in${outCount ? ` · ${outCount} out` : ""}` : "Guessing in progress";
+    body = isHost
+      ? "Tap Still in to knock someone out. +1 when a guess is right. Pass the guess around the table."
+      : "Keep your answer on paper. This screen updates as the host marks guesses.";
+  }
+
+  return (
+    <section className="status-banner" data-tone={tone} aria-live="polite">
+      <h2>{title}</h2>
+      <p>{body}</p>
+    </section>
+  );
+}
 
 function PromptCard({
   topic,
@@ -293,189 +421,88 @@ function PromptCard({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(topic);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Sync external topic changes (from WS) into draft when not editing
   useEffect(() => {
     if (!editing) setDraft(topic);
   }, [topic, editing]);
 
   const commitEdit = () => {
     setEditing(false);
-    if (draft.trim() !== topic) {
-      onSetTopic(draft.trim());
-    }
+    if (draft.trim() !== topic) onSetTopic(draft.trim());
+  };
+
+  const cancelEdit = () => {
+    setDraft(topic);
+    setEditing(false);
   };
 
   return (
-    <section style={{ width: "100%", maxWidth: 540, margin: "0 auto 32px" }}>
-      <div
-        className="td-card"
-        style={{ background: "#fdf8f0", padding: "28px 28px 22px", borderRadius: "9px" }}
-      >
-        {/* Mustard rubber-stamp circle ornament */}
-        <div
-          aria-hidden="true"
-          style={{
-            position: "absolute",
-            top: "-18px",
-            right: "-14px",
-            width: "52px",
-            height: "52px",
-            borderRadius: "50%",
-            background: "radial-gradient(circle at 40% 38%, #e8c050 0%, #d9a62a 60%, #b8881e 100%)",
-            boxShadow: "inset 0 2px 2px rgba(255,255,255,0.35), inset 0 -3px 5px rgba(0,0,0,0.35), 0 3px 8px rgba(0,0,0,0.3)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            transform: "rotate(-10deg)",
-          }}
-        >
-          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-            <text
-              x="14"
-              y="18"
-              textAnchor="middle"
-              fontFamily="'Cormorant Garamond', Georgia, serif"
-              fontVariant="small-caps"
-              fontWeight="700"
-              fontSize="9"
-              letterSpacing="0.5"
-              fill="#2a1f16"
-              opacity="0.85"
-            >
-              THINGS
-            </text>
-          </svg>
-        </div>
-
-        {/* Prompt text or editing textarea */}
-        {isHost && editing ? (
-          <textarea
-            ref={textareaRef}
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onBlur={commitEdit}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                commitEdit();
-              }
-              if (e.key === "Escape") {
-                setDraft(topic);
-                setEditing(false);
-              }
-            }}
-            autoFocus
-            rows={2}
-            placeholder="Click to set a prompt…"
-            style={{
-              width: "100%",
-              background: "transparent",
-              border: "none",
-              borderBottom: "1.5px solid rgba(200,55,42,0.4)",
-              outline: "none",
-              fontFamily: "var(--serif)",
-              fontStyle: "italic",
-              fontSize: "clamp(17px, 2.5vw, 24px)",
-              lineHeight: 1.35,
-              letterSpacing: "0.01em",
-              color: "var(--ink)",
-              resize: "none",
-              padding: "2px 0",
-              zIndex: 1,
-              position: "relative",
-            }}
-          />
-        ) : (
-          <div style={{ position: "relative", zIndex: 1 }}>
-            <p
-              className="font-serif italic"
-              style={{
-                fontFamily: "var(--serif)",
-                fontStyle: "italic",
-                color: "var(--ink)",
-                fontSize: "clamp(17px, 2.5vw, 24px)",
-                lineHeight: 1.35,
-                letterSpacing: "0.01em",
-                margin: 0,
-                cursor: isHost ? "pointer" : "default",
-                minHeight: 32,
-              }}
-              onClick={isHost ? () => setEditing(true) : undefined}
-              title={isHost ? "Click to edit prompt" : undefined}
-            >
-              {topic || (
-                <span style={{ color: "rgba(42,31,22,0.35)", fontStyle: "italic" }}>
-                  {isHost ? "Click to set a prompt…" : "No prompt set yet"}
-                </span>
-              )}
-            </p>
-            {/* Edit hint icon — visible on hover for host */}
-            {isHost && topic && (
-              <button
-                onClick={() => setEditing(true)}
-                aria-label="Edit prompt"
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  right: -4,
-                  background: "none",
-                  border: "none",
-                  cursor: "pointer",
-                  color: "rgba(42,31,22,0.3)",
-                  padding: 2,
-                  opacity: 0,
-                  transition: "opacity 0.15s",
-                  zIndex: 2,
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
-                onMouseLeave={(e) => (e.currentTarget.style.opacity = "0")}
-              >
-                <PencilIcon size={14} />
+    <section className="prompt-wrap">
+      <div className="td-card prompt-card">
+        <div className="prompt-kicker">
+          <span className="sc">Prompt</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            {isHost && !editing && (
+              <button type="button" className="text-btn" onClick={() => setEditing(true)}>
+                Edit
               </button>
             )}
+            <div className="prompt-seal" aria-hidden="true">
+              Things
+            </div>
           </div>
-        )}
+        </div>
 
-        {/* Caveat flavor annotation — only shown while no real prompt is set,
-            so the example disappears as soon as the host types something
-            (either committed or still being drafted). */}
-        {!topic.trim() && !draft.trim() && (
-          <p
-            style={{
-              fontFamily: "var(--script)",
-              fontSize: "17px",
-              color: "rgba(42,31,22,0.5)",
-              marginTop: 12,
-              marginBottom: 0,
-              position: "relative",
-              zIndex: 1,
-            }}
+        {isHost && editing ? (
+          <>
+            <textarea
+              className="prompt-editor"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  commitEdit();
+                }
+                if (e.key === "Escape") cancelEdit();
+              }}
+              autoFocus
+              rows={2}
+              maxLength={280}
+              placeholder="What should everyone write about?"
+              aria-label="Prompt"
+            />
+            <div className="prompt-actions">
+              <BtnSecondary type="button" onClick={cancelEdit}>
+                Cancel
+              </BtnSecondary>
+              <BtnPrimary type="button" onClick={commitEdit}>
+                Save prompt
+              </BtnPrimary>
+            </div>
+          </>
+        ) : isHost ? (
+          <button
+            type="button"
+            className={`prompt-text${topic ? "" : " is-empty"}`}
+            onClick={() => setEditing(true)}
           >
-            e.g. — what you would regret the moment it leaves your mouth
+            {topic || "Tap to set a prompt"}
+          </button>
+        ) : (
+          <p className={`prompt-text prompt-static${topic ? "" : " is-empty"}`}>
+            {topic || "No prompt yet"}
           </p>
         )}
 
-        {/* Ruled-line decorative bottom strip */}
-        <div
-          aria-hidden="true"
-          style={{
-            position: "relative",
-            marginTop: 20,
-            height: "3px",
-            background: "repeating-linear-gradient(90deg, var(--cocktail) 0 6px, transparent 6px 10px)",
-            opacity: 0.4,
-            borderRadius: "2px",
-            zIndex: 1,
-          }}
-        />
+        {!topic.trim() && !draft.trim() && (
+          <p className="prompt-hint">e.g. — what you'd regret the moment it leaves your mouth</p>
+        )}
+        <div className="prompt-rule" aria-hidden="true" />
       </div>
     </section>
   );
 }
-
-// ── PlayerBoard ───────────────────────────────────────────────────────────────
 
 function PlayerBoard({
   players,
@@ -490,59 +517,40 @@ function PlayerBoard({
   onRemove: (name: string) => void;
   onScore: (name: string, delta: number) => void;
 }) {
-  if (!players || players.length === 0) {
+  if (!players.length) {
     return (
-      <div style={{ textAlign: "center", paddingTop: 40, paddingBottom: 40 }}>
-        <p
-          style={{
-            fontFamily: "var(--script)",
-            fontSize: "20px",
-            color: "rgba(42,31,22,0.4)",
-            margin: 0,
-          }}
-        >
-          {isHost
-            ? "No players yet — add some names above"
-            : "No players yet — host hasn't seated anyone yet"}
-        </p>
+      <div className="empty-table">
+        <p>{isHost ? "Names you add will pin up here." : "The host hasn't seated anyone yet."}</p>
       </div>
     );
   }
 
+  const active = players.filter((p) => !p.isOut);
+
   return (
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: "repeat(auto-fill, minmax(116px, 1fr))",
-        gap: 24,
-        justifyItems: "center",
-        maxWidth: 860,
-        margin: "0 auto",
-        width: "100%",
-      }}
-    >
+    <div className="player-grid">
       {players.map((player, i) => (
         <PlayerCard
           key={player.name}
           name={player.name}
           isOut={player.isOut}
+          isLast={!player.isOut && active.length === 1 && players.length > 1}
           score={player.score ?? 0}
           rotIndex={i}
           isHost={isHost}
           onToggle={() => onToggle(player.name)}
           onRemove={() => onRemove(player.name)}
-          onScore={() => onScore(player.name, 1)}
+          onScore={(delta) => onScore(player.name, delta)}
         />
       ))}
     </div>
   );
 }
 
-// ── PlayerCard ────────────────────────────────────────────────────────────────
-
 function PlayerCard({
   name,
   isOut,
+  isLast,
   score,
   rotIndex,
   isHost,
@@ -552,208 +560,81 @@ function PlayerCard({
 }: {
   name: string;
   isOut: boolean;
+  isLast: boolean;
   score: number;
   rotIndex: number;
   isHost: boolean;
   onToggle: () => void;
   onRemove: () => void;
-  onScore: () => void;
+  onScore: (delta: number) => void;
 }) {
   const rot = PIN_ROTATIONS[rotIndex % PIN_ROTATIONS.length];
 
-  const cardProps = isHost
-    ? {
-        role: "button" as const,
-        tabIndex: 0,
-        "aria-pressed": isOut,
-        "aria-label": `${name} — ${isOut ? "out" : "in"}. Click to toggle.`,
-        onClick: onToggle,
-        onKeyDown: (e: React.KeyboardEvent) =>
-          (e.key === "Enter" || e.key === " ") && onToggle(),
-      }
-    : {
-        "aria-label": `${name} — ${isOut ? "out" : "in"}`,
-      };
-
   return (
-    <div
-      className={`td-pinned${isOut ? " is-out" : ""}${!isHost ? " viewer-mode" : ""}`}
-      style={{ "--pin-rot": `${rot}deg` } as React.CSSProperties}
-      {...cardProps}
+    <article
+      className={`player-card td-pinned${isOut ? " is-out" : ""}${isLast ? " is-last" : ""}`}
+      style={{ "--pin-rot": `${rot}deg` } as CSSProperties}
     >
-      {/* Push pin */}
-      <div
-        style={{
-          position: "absolute",
-          top: "-10px",
-          left: "50%",
-          transform: "translateX(-50%)",
-          zIndex: 10,
-          filter: "drop-shadow(0 2px 3px rgba(0,0,0,0.4))",
-          pointerEvents: "none",
-        }}
-      >
-        <Pin size={22} color={isOut ? "#888" : "#c8372a"} />
+      <div className="player-pin" aria-hidden="true">
+        <Pin size={20} color={isOut ? "#6b5344" : "#c8372a"} />
       </div>
-
-      {/* Status wax stamp (IN) */}
-      {!isOut && (
-        <div
-          aria-hidden="true"
-          style={{
-            position: "absolute",
-            top: "8px",
-            right: "8px",
-            width: "28px",
-            height: "28px",
-            borderRadius: "50%",
-            background: "radial-gradient(circle at 40% 38%, #e0483c 0%, #c8372a 60%, #8f1e16 100%)",
-            boxShadow: "inset 0 1px 2px rgba(255,255,255,0.3), inset 0 -2px 4px rgba(0,0,0,0.4), 0 2px 6px rgba(0,0,0,0.35)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            transform: "rotate(-8deg)",
-          }}
-        >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-            <text
-              x="8"
-              y="11.5"
-              textAnchor="middle"
-              fontFamily="'Cormorant Garamond', Georgia, serif"
-              fontWeight="700"
-              fontSize="8"
-              letterSpacing="0.3"
-              fill="rgba(255,255,255,0.9)"
-            >
-              IN
-            </text>
-          </svg>
-        </div>
-      )}
-
-      {/* Name */}
-      <div
-        style={{
-          fontFamily: "var(--serif)",
-          fontWeight: 600,
-          fontSize: "19px",
-          textAlign: "center",
-          lineHeight: 1.2,
-          color: "var(--ink)",
-          position: "relative",
-          zIndex: 1,
-        }}
-      >
-        {name}
+      <div className="player-main">
+        <h3 className={`player-name${isOut ? " is-out" : ""}`}>{name}</h3>
+        {isLast && <p className="player-last">last one in</p>}
       </div>
-
-      {/* Strike-through when OUT */}
-      {isOut && (
-        <div
-          style={{ display: "flex", justifyContent: "center", marginTop: 4, position: "relative", zIndex: 1 }}
-        >
-          <Strike width={name.length * 8 + 16} height={3} color="rgba(200,55,42,0.65)" />
-        </div>
-      )}
-
-      {/* Score row — score chip on the left, +1 button on the right (host only).
-          Shown on every card so viewers can see scores too. */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          gap: 8,
-          marginTop: 10,
-          position: "relative",
-          zIndex: 1,
-        }}
-      >
-        <span
-          aria-label={`${name} has ${score} point${score === 1 ? "" : "s"}`}
-          style={{
-            fontFamily: "var(--serif)",
-            fontVariant: "small-caps",
-            letterSpacing: "0.12em",
-            fontSize: 11,
-            color: "rgba(42,31,22,0.6)",
-          }}
-        >
-          {score} pt{score === 1 ? "" : "s"}
-        </span>
-        {isHost && (
+      <div className={`player-controls${isHost ? " is-host" : ""}`}>
+        {isHost ? (
           <button
             type="button"
-            aria-label={`Award a point to ${name}`}
-            title="Guessed correctly — +1 point"
-            onClick={(e) => {
-              e.stopPropagation();
-              onScore();
-            }}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              minWidth: 26,
-              height: 22,
-              padding: "0 7px",
-              borderRadius: 11,
-              border: "1px solid rgba(42,31,22,0.25)",
-              background: "#fdf8f0",
-              cursor: "pointer",
-              fontFamily: "var(--serif)",
-              fontWeight: 700,
-              fontSize: 12,
-              lineHeight: 1,
-              color: "var(--ink)",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.background = "#f3e6c8";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "#fdf8f0";
-            }}
+            className={`status-btn${isOut ? " is-out" : ""}`}
+            aria-pressed={isOut}
+            aria-label={`${name}, ${isOut ? "out" : "still in"}. ${isOut ? "Mark still in" : "Knock out"}`}
+            onClick={onToggle}
           >
-            +1
+            {isOut ? "Out" : "Still in"}
+          </button>
+        ) : (
+          <span className={`status-btn${isOut ? " is-out" : ""}`} aria-label={`${name} is ${isOut ? "out" : "still in"}`}>
+            {isOut ? "Out" : "Still in"}
+          </span>
+        )}
+        <div className="score-row">
+          {isHost && (
+            <button
+              type="button"
+              className="score-btn"
+              aria-label={`Remove a point from ${name}`}
+              disabled={score <= 0}
+              onClick={() => onScore(-1)}
+            >
+              −
+            </button>
+          )}
+          <span className="score-val" aria-label={`${score} ${score === 1 ? "point" : "points"}`}>
+            {score}
+            <span className="score-unit"> pts</span>
+          </span>
+          {isHost && (
+            <button
+              type="button"
+              className="score-btn"
+              aria-label={`Award a point to ${name}`}
+              onClick={() => onScore(1)}
+            >
+              +
+            </button>
+          )}
+        </div>
+        {isHost && (
+          <button type="button" className="remove-btn" aria-label={`Remove ${name}`} onClick={onRemove}>
+            <TrashIcon size={16} />
+            <span className="remove-label">Remove</span>
           </button>
         )}
       </div>
-
-      {/* Remove button — host only */}
-      {isHost && (
-        <button
-          className="absolute bottom-2 right-2 transition-opacity"
-          style={{
-            position: "absolute",
-            bottom: 8,
-            right: 8,
-            background: "none",
-            border: "none",
-            cursor: "pointer",
-            color: "rgba(42,31,22,0.3)",
-            padding: "2px",
-            zIndex: 2,
-            lineHeight: 1,
-          }}
-          aria-label={`Remove ${name}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onRemove();
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = "#c8372a")}
-          onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(42,31,22,0.3)")}
-          type="button"
-        >
-          <TrashIcon size={13} />
-        </button>
-      )}
-    </div>
+    </article>
   );
 }
-
-// ── Scoreboard ────────────────────────────────────────────────────────────────
 
 function Scoreboard({
   players,
@@ -765,201 +646,124 @@ function Scoreboard({
   onResetScores: () => void;
 }) {
   const [open, setOpen] = useState(true);
-  if (!players || players.length === 0) return null;
+  if (!players.length) return null;
 
-  // Sort by score desc, then name for stability.
   const ranked = [...players].sort((a, b) => {
     const s = (b.score ?? 0) - (a.score ?? 0);
     return s !== 0 ? s : a.name.localeCompare(b.name);
   });
+  const top = ranked[0]?.score ?? 0;
 
   return (
-    <section
-      style={{
-        width: "100%",
-        maxWidth: 640,
-        margin: "32px auto 0",
-      }}
-    >
-      <div
-        className="td-card"
-        style={{
-          background: "#fdf8f0",
-          padding: "14px 20px",
-          borderRadius: 9,
-        }}
-      >
-        {/* Header row */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            position: "relative",
-            zIndex: 1,
-          }}
-        >
+    <section className="score-section" style={{ marginTop: 8 }}>
+      <div className="td-card" style={{ background: "#fdf8f0", padding: "8px 16px 14px", borderRadius: 9 }}>
+        <div className="section-head">
           <button
             type="button"
+            className="section-toggle"
             onClick={() => setOpen((o) => !o)}
             aria-expanded={open}
             aria-controls="got-scoreboard-body"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              background: "transparent",
-              border: "none",
-              cursor: "pointer",
-              padding: 0,
-              fontFamily: "var(--serif)",
-              fontVariant: "small-caps",
-              fontWeight: 600,
-              fontSize: 14,
-              letterSpacing: "0.14em",
-              color: "var(--ink)",
-            }}
           >
-            <span aria-hidden="true" style={{ fontSize: 10, opacity: 0.5 }}>
-              {open ? "▾" : "▸"}
-            </span>
-            Scoreboard
+            <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+            Scores
           </button>
-          <div
-            aria-hidden="true"
-            style={{
-              flex: 1,
-              height: 1,
-              background:
-                "repeating-linear-gradient(90deg, rgba(42,31,22,0.3) 0 4px, transparent 4px 8px)",
-            }}
-          />
+          <div className="rule" aria-hidden="true" />
           {isHost && open && (
-            <button
-              type="button"
-              onClick={onResetScores}
-              style={{
-                background: "transparent",
-                border: "none",
-                cursor: "pointer",
-                fontFamily: "var(--serif)",
-                fontVariant: "small-caps",
-                letterSpacing: "0.18em",
-                fontSize: 11,
-                color: "rgba(42,31,22,0.55)",
-                padding: "2px 4px",
-              }}
-              title="Reset all scores to zero"
-            >
-              Reset
+            <button type="button" className="text-btn" onClick={onResetScores}>
+              Reset scores
             </button>
           )}
         </div>
-
-        {/* Body */}
         {open && (
-          <ul
-            id="got-scoreboard-body"
-            style={{
-              listStyle: "none",
-              margin: "10px 0 0",
-              padding: 0,
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))",
-              gap: "6px 18px",
-              position: "relative",
-              zIndex: 1,
-            }}
-          >
-            {ranked.map((p) => (
-              <li
-                key={p.name}
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "baseline",
-                  gap: 8,
-                  fontFamily: "var(--serif)",
-                  fontSize: 15,
-                  color: "var(--ink)",
-                  borderBottom: "1px dotted rgba(42,31,22,0.2)",
-                  padding: "2px 0",
-                }}
-              >
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {p.name}
-                </span>
-                <span
-                  style={{
-                    fontWeight: 700,
-                    fontVariant: "tabular-nums",
-                    color: "var(--ink)",
-                  }}
-                >
-                  {p.score ?? 0}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <ol id="got-scoreboard-body" className="score-list">
+            {ranked.map((p) => {
+              const leading = top > 0 && (p.score ?? 0) === top;
+              return (
+                <li key={p.name}>
+                  <span className="who">
+                    {p.name}
+                    {leading ? " · lead" : ""}
+                  </span>
+                  <span className={`pts${leading ? " lead" : ""}`}>{p.score ?? 0}</span>
+                </li>
+              );
+            })}
+          </ol>
         )}
       </div>
     </section>
   );
 }
 
-// ── AddPlayerForm ─────────────────────────────────────────────────────────────
-
-function AddPlayerForm({ onAdd }: { onAdd: (name: string) => void }) {
+function AddPlayerForm({
+  players,
+  onAdd,
+}: {
+  players: { name: string }[];
+  onAdd: (name: string) => void;
+}) {
   const [newName, setNewName] = useState("");
+  const [error, setError] = useState("");
 
   const handleAdd = () => {
     const name = newName.trim();
-    if (!name) return;
+    if (!name) {
+      setError("Type a name first.");
+      document.getElementById("add-player-input")?.focus();
+      return;
+    }
+    if (players.some((p) => p.name.toLowerCase() === name.toLowerCase())) {
+      setError("That name is already at the table.");
+      return;
+    }
+    setError("");
     onAdd(name);
     setNewName("");
   };
 
   return (
-    <div style={{ display: "flex", alignItems: "flex-end", gap: 12, marginBottom: 32 }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-        <label
-          className="sc"
-          htmlFor="add-player-input"
-          style={{
-            fontFamily: "var(--serif)",
-            fontVariant: "small-caps",
-            fontSize: "10.5px",
-            letterSpacing: "0.2em",
-            color: "rgba(42,31,22,0.55)",
-          }}
-        >
-          Add Player
+    <form
+      className="add-player"
+      onSubmit={(e) => {
+        e.preventDefault();
+        handleAdd();
+      }}
+    >
+      <div className="name-field">
+        <label className="field-label" htmlFor="add-player-input">
+          Add a player
         </label>
         <input
           id="add-player-input"
           type="text"
-          placeholder="a name..."
+          placeholder="Name at the table"
           value={newName}
-          onChange={(e) => setNewName(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+          onChange={(e) => {
+            setNewName(e.target.value);
+            if (error) setError("");
+          }}
           className="td-input"
-          style={{ width: "180px" }}
+          style={{ width: "100%" }}
           maxLength={24}
+          autoCapitalize="words"
+          enterKeyHint="done"
+          aria-invalid={Boolean(error)}
+          aria-describedby={error ? "add-player-error" : undefined}
         />
+        {error && (
+          <p className="add-error" id="add-player-error">
+            {error}
+          </p>
+        )}
       </div>
-      <BtnPrimary
-        onClick={handleAdd}
-        type="button"
-        style={{ paddingTop: "8px", paddingBottom: "8px" }}
-      >
-        <PlusIcon size={14} />
+      <BtnPrimary type="submit">
+        <PlusIcon size={16} />
         Add
       </BtnPrimary>
-    </div>
+    </form>
   );
 }
-
-// ── NotesSection ──────────────────────────────────────────────────────────────
 
 function NotesSection({
   notes,
@@ -970,26 +774,21 @@ function NotesSection({
   isHost: boolean;
   onSetNotes: (n: string) => void;
 }) {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [localNotes, setLocalNotes] = useState(notes);
-
-  // Sync external notes when WS updates arrive (only if not actively editing)
   const isEditingRef = useRef(false);
+  const [localNotes, setLocalNotes] = useState(notes);
+  const [revealed, setRevealed] = useState(false);
+
   useEffect(() => {
-    if (!isEditingRef.current) {
-      setLocalNotes(notes);
-    }
+    if (!isEditingRef.current) setLocalNotes(notes);
   }, [notes]);
 
-  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+  const handleChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setLocalNotes(val);
     isEditingRef.current = true;
-    // Auto-resize
     e.target.style.height = "auto";
-    e.target.style.height = e.target.scrollHeight + "px";
-    // Debounce send
+    e.target.style.height = `${e.target.scrollHeight}px`;
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       onSetNotes(val);
@@ -997,79 +796,42 @@ function NotesSection({
     }, 250);
   };
 
-  return (
-    <section style={{ width: "100%", maxWidth: 640, margin: "32px auto 0" }}>
-      <div className="td-scroll">
-        {/* Header */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            marginBottom: 12,
-            paddingBottom: 12,
-            borderBottom: "1px solid rgba(42,31,22,0.15)",
-          }}
-        >
-          <h2
-            style={{
-              fontFamily: "var(--serif)",
-              fontVariant: "small-caps",
-              fontWeight: 600,
-              fontSize: "16px",
-              letterSpacing: "0.14em",
-              color: "var(--ink)",
-              margin: 0,
-            }}
-          >
-            Round Notes
-          </h2>
-          <div
-            aria-hidden="true"
-            style={{
-              flex: 1,
-              height: "1px",
-              background:
-                "repeating-linear-gradient(90deg, rgba(42,31,22,0.3) 0 4px, transparent 4px 8px)",
-            }}
-          />
-          <span
-            style={{
-              fontFamily: "var(--script)",
-              fontSize: "16px",
-              color: "rgba(42,31,22,0.4)",
-            }}
-          >
-            who said what
-          </span>
-        </div>
+  const covered = !isHost && !revealed && localNotes.trim().length > 0;
 
+  return (
+    <section className="notes-section">
+      <div className="td-scroll">
+        <div className="section-head" style={{ marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid rgba(42,31,22,0.15)" }}>
+          <h2>Round notes</h2>
+          <div className="rule" aria-hidden="true" />
+        </div>
+        <p className="notes-hint">
+          {isHost
+            ? "Everyone with the link can open these. Leave them blank during the guess if you don't want to spoil who said what."
+            : "The host's scratch pad. Covered until you ask to see it."}
+        </p>
         {isHost ? (
           <textarea
-            ref={textareaRef}
             className="td-notebook"
-            placeholder="jot it down..."
+            placeholder="Jot a reminder after the round…"
             value={localNotes}
             onChange={handleChange}
-            onInput={(e) => {
-              const t = e.currentTarget;
-              t.style.height = "auto";
-              t.style.height = t.scrollHeight + "px";
-            }}
+            maxLength={10000}
             rows={4}
+            aria-label="Round notes"
           />
+        ) : covered ? (
+          <div className="notes-cover">
+            <p>Notes are covered so the round isn't spoiled.</p>
+            <BtnSecondary type="button" onClick={() => setRevealed(true)}>
+              Show notes
+            </BtnSecondary>
+          </div>
         ) : (
-          <div className="td-notebook-readonly">
+          <div className="td-notebook-readonly" aria-label="Round notes">
             {localNotes || (
-              <span
-                style={{
-                  fontFamily: "var(--script)",
-                  fontSize: 16,
-                  color: "rgba(42,31,22,0.35)",
-                  fontStyle: "italic",
-                }}
-              >
-                (host hasn&apos;t written any notes yet)
+              <span style={{ fontFamily: "var(--script)", fontSize: 18, color: "var(--ink-soft)" }}>
+                Nothing written yet.
               </span>
             )}
           </div>
@@ -1079,82 +841,145 @@ function NotesSection({
   );
 }
 
-// ── ResetModal ────────────────────────────────────────────────────────────────
+function useDialog(onCancel: () => void) {
+  const ref = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef(onCancel);
+  cancelRef.current = onCancel;
 
-function ResetModal({
+  useEffect(() => {
+    const previously = document.activeElement as HTMLElement | null;
+    const dialog = ref.current;
+    const focusables = () =>
+      [...(dialog?.querySelectorAll<HTMLElement>("button, [href], input, textarea, select") ?? [])].filter(
+        (el) => !el.hasAttribute("disabled"),
+      );
+    dialog?.setAttribute("tabindex", "-1");
+    (dialog?.querySelector<HTMLElement>("[data-autofocus]") ?? dialog)?.focus();
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelRef.current();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      previously?.focus();
+    };
+  }, []);
+
+  return ref;
+}
+
+function ResetRoundModal({
   onCancel,
   onConfirm,
 }: {
   onCancel: () => void;
-  onConfirm: () => void;
+  onConfirm: (clearNotes: boolean) => void;
 }) {
+  const [clearNotes, setClearNotes] = useState(false);
+  const ref = useDialog(onCancel);
+
   return (
-    <div className="modal-scroll-overlay">
-      <div className="modal-scroll">
-        <div style={{ position: "relative", zIndex: 1 }}>
-          {/* Title */}
-          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 12 }}>
-            <h3
-              style={{
-                fontFamily: "var(--serif)",
-                fontVariant: "small-caps",
-                fontWeight: 600,
-                fontSize: 20,
-                letterSpacing: "0.14em",
-                color: "var(--ink)",
-                margin: 0,
-              }}
-            >
-              Reset the Round?
-            </h3>
-            <button
-              onClick={onCancel}
-              type="button"
-              aria-label="Cancel"
-              style={{
-                background: "transparent",
-                border: "none",
-                cursor: "pointer",
-                color: "rgba(42,31,22,0.45)",
-                padding: 2,
-                marginTop: 2,
-              }}
-            >
-              <CloseIcon size={16} />
+    <div
+      className="modal-scroll-overlay"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
+      <div
+        className="modal-scroll"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="reset-round-title"
+        ref={ref}
+      >
+        <div className="modal-card-body">
+          <div className="modal-title-row">
+            <h3 id="reset-round-title">Next round?</h3>
+            <button type="button" className="icon-hit" aria-label="Close" onClick={onCancel}>
+              <CloseIcon size={18} />
             </button>
           </div>
-
-          {/* Body */}
-          <p
-            style={{
-              fontFamily: "var(--serif)",
-              fontStyle: "italic",
-              fontSize: 16,
-              color: "var(--ink-soft)",
-              margin: "0 0 6px",
-              lineHeight: 1.5,
-            }}
-          >
-            All players will be flipped back to IN. Your notes and topic stay.
+          <p className="modal-copy">
+            Everyone is marked still in again. Scores and the prompt stay. Change the prompt if this round needs a new one.
           </p>
-          <p
-            style={{
-              fontFamily: "var(--script)",
-              fontSize: 17,
-              color: "rgba(42,31,22,0.45)",
-              margin: "0 0 20px",
-            }}
-          >
-            fresh prompt, fresh start
-          </p>
-
-          {/* Buttons */}
-          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-            <BtnSecondary onClick={onCancel} type="button">
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={clearNotes}
+              onChange={(e) => setClearNotes(e.target.checked)}
+            />
+            <span className="check-box" aria-hidden="true" />
+            Also clear the notes
+          </label>
+          <div className="modal-actions">
+            <BtnSecondary type="button" data-autofocus onClick={onCancel}>
               Cancel
             </BtnSecondary>
-            <BtnPrimary onClick={onConfirm} type="button">
-              Reset
+            <BtnPrimary type="button" onClick={() => onConfirm(clearNotes)}>
+              Next round
+            </BtnPrimary>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmModal({
+  title,
+  body,
+  confirmLabel,
+  onCancel,
+  onConfirm,
+}: {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const ref = useDialog(onCancel);
+  const titleId = "confirm-title";
+
+  return (
+    <div
+      className="modal-scroll-overlay"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
+      <div className="modal-scroll" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={ref}>
+        <div className="modal-card-body">
+          <div className="modal-title-row">
+            <h3 id={titleId}>{title}</h3>
+            <button type="button" className="icon-hit" aria-label="Close" onClick={onCancel}>
+              <CloseIcon size={18} />
+            </button>
+          </div>
+          <p className="modal-copy">{body}</p>
+          <div className="modal-actions">
+            <BtnSecondary type="button" data-autofocus onClick={onCancel}>
+              Cancel
+            </BtnSecondary>
+            <BtnPrimary type="button" onClick={onConfirm}>
+              {confirmLabel}
             </BtnPrimary>
           </div>
         </div>
